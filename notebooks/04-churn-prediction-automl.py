@@ -7,7 +7,7 @@
 # MAGIC
 # MAGIC **Current State**: Rule-based scoring system using RFM (Recency, Frequency, Monetary) metrics with manual thresholds.
 # MAGIC
-# MAGIC **Goal**: Compare ML predictions vs rule-based scores and identify which features truly drive churn.
+# MAGIC **Goal**: Train a production ML model to replace rule-based scoring and deploy predictions to the Gold churn-score table (`workspace.retail.gold_customer_churn_scores`) that gets synced to Lakebase and served by the RetailIQ Insights app.
 # MAGIC
 # MAGIC **Data**: `workspace.retail.gold_customer_churn_features` - 5,000 customers with ML-ready features
 # MAGIC - Target: `churn_label_proxy` (1 = high risk, 0 = low risk)
@@ -412,3 +412,90 @@ print("\n" + "="*70)
 print("\nSample Cases Where ML and Rules Disagree (Top 10 by ML probability):\n")
 interesting = disagreements.nlargest(10, 'ml_churn_probability')
 display(interesting[['customer_id', 'actual_churn', 'ml_churn_probability', 'churn_score', 'churn_risk_band']])
+
+# COMMAND ----------
+
+# DBTITLE 1,Deploy ML Predictions to Gold Table
+# =============================================================================
+# DEPLOY: Write ML predictions to production Gold churn-score table
+# This overwrites the rule-based scores in gold_customer_churn_scores
+# with ML model predictions. This is the table synced to Lakebase and
+# served by the RetailIQ Insights app.
+# =============================================================================
+
+from pyspark.sql import functions as F
+
+# Generate ML predictions for all customers
+ml_proba = best_model.predict_proba(X_encoded)[:, 1]
+ml_pred = best_model.predict(X_encoded)
+
+# Create deployment dataframe
+deploy_df = pd.DataFrame({
+    'customer_id': df['customer_id'],
+    'ml_churn_probability': ml_proba,
+    'ml_churn_prediction': ml_pred,
+})
+
+# Convert probability to churn score (0-100, higher = more likely to churn)
+deploy_df['churn_score'] = (deploy_df['ml_churn_probability'] * 100).round().astype(int)
+
+# Assign risk bands based on ML probability
+deploy_df['churn_risk_band'] = deploy_df['ml_churn_probability'].apply(
+    lambda p: 'High' if p >= 0.6 else ('Medium' if p >= 0.3 else 'Low')
+)
+
+# Generate top churn reasons based on customer features
+df_with_reasons = df.copy()
+df_with_reasons['top_reason_1'] = df_with_reasons.apply(
+    lambda r: 'Extended purchase gap (180+ days)' if r['days_since_last_purchase'] > 180
+    else ('No recent engagement (90+ days)' if r['days_since_last_purchase'] > 90
+    else 'Declining engagement'),
+    axis=1
+)
+df_with_reasons['top_reason_2'] = df_with_reasons.apply(
+    lambda r: 'Low purchase frequency' if r['transactions_last_90d'] < 3
+    else ('Low revenue decline' if r['revenue_last_90d'] < 200
+    else ('High refund rate' if r['refund_return_rate'] > 0.1
+    else 'Limited engagement')),
+    axis=1
+)
+
+# Generate recommended actions based on risk band
+deploy_df['recommended_action'] = deploy_df['churn_risk_band'].map({
+    'High': 'Send re-engagement campaign with 15% discount',
+    'Medium': 'Send personalized product recommendations',
+    'Low': 'Continue loyalty rewards program',
+})
+
+deploy_df['top_reason_1'] = df_with_reasons['top_reason_1'].values
+deploy_df['top_reason_2'] = df_with_reasons['top_reason_2'].values
+
+# Select final columns matching the Gold table schema
+final_df = deploy_df[['customer_id', 'churn_score', 'churn_risk_band', 'top_reason_1', 'top_reason_2', 'recommended_action']]
+
+print(f"ML predictions ready for deployment:")
+print(f"  Total customers: {len(final_df)}")
+print(f"  High risk: {(final_df['churn_risk_band'] == 'High').sum()}")
+print(f"  Medium risk: {(final_df['churn_risk_band'] == 'Medium').sum()}")
+print(f"  Low risk: {(final_df['churn_risk_band'] == 'Low').sum()}")
+print(f"  Avg churn score: {final_df['churn_score'].mean():.1f}")
+
+# Write ML predictions to the production Gold table (overwriting rule-based scores)
+spark_df = spark.createDataFrame(final_df)
+spark_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("workspace.retail.gold_customer_churn_scores")
+
+print(f"\n✅ ML predictions written to workspace.retail.gold_customer_churn_scores")
+print(f"   This table is synced to Lakebase and served by the RetailIQ Insights app.")
+
+# Enable Change Data Feed for Lakebase sync
+spark.sql("ALTER TABLE workspace.retail.gold_customer_churn_scores SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+print(f"✅ CDF enabled on gold_customer_churn_scores for Lakebase sync")
+
+# Verify the deployment
+verification = spark.table("workspace.retail.gold_customer_churn_scores")
+print(f"\nVerification:")
+print(f"  Row count: {verification.count()}")
+print(f"  Schema:")
+verification.printSchema()
+print(f"\n  Sample ML predictions:")
+verification.show(5, truncate=False)
