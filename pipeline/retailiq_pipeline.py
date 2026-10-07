@@ -192,10 +192,11 @@ def silver_pos():
 
 # =============================================================================
 # GOLD LAYER - Business aggregations (Materialized Views, batch reads)
+# These canonical gold_* tables feed ML training, Lakebase sync, Genie, and the app
 # =============================================================================
 
 @dlt.table(
-    name="sdp_gold_customer_360",
+    name="gold_customer_360",
     comment="Unified customer 360 view: RFM metrics, loyalty, omnichannel revenue"
 )
 def gold_customer_360():
@@ -284,6 +285,7 @@ def gold_customer_360():
             F.col("customer_id"),
             F.concat_ws(" ", F.col("first_name"), F.col("last_name")).alias("full_name"),
             F.col("email"),
+            F.col("phone"),
             F.col("city"),
             F.col("state"),
             F.col("loyalty_tier"),
@@ -297,7 +299,7 @@ def gold_customer_360():
             F.when(total_txn > 0, total_rev / total_txn).otherwise(0.0).alias("avg_order_value"),
             F.col("first_purchase_date"),
             F.col("last_purchase_date"),
-            F.datediff(F.current_date(), F.col("last_purchase_date")).alias("days_since_last_purchase"),
+            F.coalesce(F.datediff(F.current_date(), F.col("last_purchase_date")), F.lit(9999)).alias("days_since_last_purchase"),
             F.col("favorite_category"),
             F.col("preferred_channel"),
             F.coalesce(F.col("refund_return_count"), F.lit(0)).alias("refund_return_count"),
@@ -307,11 +309,121 @@ def gold_customer_360():
 
 
 @dlt.table(
-    name="sdp_gold_customer_churn_scores",
+    name="gold_customer_churn_features",
+    comment="ML-ready churn prediction features derived from customer 360 and silver layer. Label has 12%% noise to prevent trivial separation."
+)
+def gold_customer_churn_features():
+    cust360 = spark.read.table("gold_customer_360")
+    customers = spark.read.table("sdp_silver_customers")
+    orders = spark.read.table("sdp_silver_orders")
+    pos = spark.read.table("sdp_silver_pos")
+
+    # Customer tenure from registration date
+    tenure = customers.select(
+        F.col("customer_id"),
+        F.coalesce(F.datediff(F.current_date(), F.col("registration_date")), F.lit(0)).cast("int").alias("customer_tenure_days"),
+    )
+
+    # Last 30/90 day aggregations from completed orders
+    orders_30d = (
+        orders.filter(
+            (F.col("order_status") == "Completed") &
+            (F.col("order_date") >= F.date_sub(F.current_date(), 30))
+        )
+        .groupBy("customer_id")
+        .agg(
+            F.count("*").alias("ord_30d_cnt"),
+            F.sum("order_amount").alias("ord_30d_rev"),
+        )
+    )
+
+    orders_90d = (
+        orders.filter(
+            (F.col("order_status") == "Completed") &
+            (F.col("order_date") >= F.date_sub(F.current_date(), 90))
+        )
+        .groupBy("customer_id")
+        .agg(
+            F.count("*").alias("ord_90d_cnt"),
+            F.sum("order_amount").alias("ord_90d_rev"),
+        )
+    )
+
+    # Last 30/90 day aggregations from completed POS transactions
+    pos_30d = (
+        pos.filter(
+            (F.col("transaction_status") == "Completed") &
+            (F.col("transaction_date") >= F.date_sub(F.current_date(), 30))
+        )
+        .groupBy("customer_id")
+        .agg(
+            F.count("*").alias("pos_30d_cnt"),
+            F.sum("transaction_amount").alias("pos_30d_rev"),
+        )
+    )
+
+    pos_90d = (
+        pos.filter(
+            (F.col("transaction_status") == "Completed") &
+            (F.col("transaction_date") >= F.date_sub(F.current_date(), 90))
+        )
+        .groupBy("customer_id")
+        .agg(
+            F.count("*").alias("pos_90d_cnt"),
+            F.sum("transaction_amount").alias("pos_90d_rev"),
+        )
+    )
+
+    combined = (
+        cust360
+        .join(tenure, "customer_id", "left")
+        .join(orders_30d, "customer_id", "left")
+        .join(orders_90d, "customer_id", "left")
+        .join(pos_30d, "customer_id", "left")
+        .join(pos_90d, "customer_id", "left")
+    )
+
+    txn_30d = F.coalesce(F.col("ord_30d_cnt"), F.lit(0)) + F.coalesce(F.col("pos_30d_cnt"), F.lit(0))
+    txn_90d = F.coalesce(F.col("ord_90d_cnt"), F.lit(0)) + F.coalesce(F.col("pos_90d_cnt"), F.lit(0))
+    rev_30d = F.coalesce(F.col("ord_30d_rev"), F.lit(0)) + F.coalesce(F.col("pos_30d_rev"), F.lit(0))
+    rev_90d = F.coalesce(F.col("ord_90d_rev"), F.lit(0)) + F.coalesce(F.col("pos_90d_rev"), F.lit(0))
+
+    total_txn = F.coalesce(F.col("total_transactions"), F.lit(0))
+    refund_cnt = F.coalesce(F.col("refund_return_count"), F.lit(0))
+    refund_rate = F.when(total_txn > 0, refund_cnt / total_txn).otherwise(0.0)
+
+    # Base churn label: deterministic rule (days_since_last_purchase > 90)
+    base_label = F.when(F.col("days_since_last_purchase") > 90, F.lit(1)).otherwise(F.lit(0))
+
+    # Add 12%% noise: flip label with probability 0.12 to prevent trivial separation
+    noisy_label = F.when(F.rand() < 0.12, F.lit(1) - base_label).otherwise(base_label)
+
+    return (
+        combined.select(
+            F.col("customer_id"),
+            F.col("loyalty_tier"),
+            F.col("points_balance").cast("long"),
+            F.col("customer_tenure_days"),
+            F.col("days_since_last_purchase"),
+            txn_30d.alias("transactions_last_30d"),
+            txn_90d.alias("transactions_last_90d"),
+            rev_30d.alias("revenue_last_30d"),
+            rev_90d.alias("revenue_last_90d"),
+            F.col("avg_order_value"),
+            F.col("preferred_channel"),
+            refund_rate.alias("refund_return_rate"),
+            F.col("favorite_category"),
+            noisy_label.cast("int").alias("churn_label_proxy"),
+        )
+    )
+
+
+@dlt.table(
+    name="gold_customer_churn_scores",
     comment="Customer churn risk scores based on RFM analysis. ML model predictions overwrite this after training."
 )
 def gold_customer_churn_scores():
-    cust360 = spark.read.table("sdp_gold_customer_360")
+    cust360 = spark.read.table("gold_customer_360")
 
     return (
         cust360.select(
@@ -345,12 +457,12 @@ def gold_customer_churn_scores():
 
 
 @dlt.table(
-    name="sdp_gold_next_best_actions",
+    name="gold_next_best_actions",
     comment="Personalized next best actions based on churn risk and customer profile"
 )
 def gold_next_best_actions():
-    cust360 = spark.read.table("sdp_gold_customer_360")
-    churn = spark.read.table("sdp_gold_customer_churn_scores")
+    cust360 = spark.read.table("gold_customer_360")
+    churn = spark.read.table("gold_customer_churn_scores")
 
     return (
         cust360.join(churn, "customer_id")
